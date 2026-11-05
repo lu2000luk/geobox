@@ -1,0 +1,9 @@
+﻿/target
+/dist
+/work/
+/data/
+/server-data/
+*.osm.pbf
+*.osm.pbf.part
+*.log
+*.pid

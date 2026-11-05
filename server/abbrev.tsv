@@ -1,0 +1,79 @@
+# Query-time abbreviation expansions. Tokens are lowercase, accent-folded, dots removed
+# ("p.za" -> "pza"). Format: token<TAB>expansion|expansion. Lines starting with "-" are
+# suffix rules: "-str<TAB>-strasse" turns "hauptstr" into "hauptstrasse".
+# Override with GEOBOX_ABBREV_FILE.
+# English
+st	street|saint
+rd	road
+ave	avenue
+av	avenue|avenida
+blvd	boulevard
+bd	boulevard
+dr	drive
+ln	lane|laan
+ct	court
+pl	place|platz|plaza|plac
+sq	square
+hwy	highway
+pkwy	parkway
+cres	crescent
+tce	terrace
+ter	terrace
+cir	circle
+mt	mount|mont
+ft	fort
+n	north|nord
+s	south|sud
+e	east|est
+w	west
+ne	northeast
+nw	northwest
+se	southeast
+sw	southwest
+# German / Dutch / Scandinavian
+str	strasse|strada|straat
+-str	-strasse|-straat
+pl	platz
+gr	gross|grosse
+kl	klein|kleine
+-g	-gatan|-gate
+-v	-vagen|-veien|-vej
+# French
+r	rue|rua
+bd	boulevard
+boul	boulevard
+ch	chemin
+imp	impasse
+all	allee
+rte	route
+ste	sainte
+fbg	faubourg
+pass	passage
+# Italian
+v	via
+vle	viale
+pza	piazza|plaza
+pzza	piazza
+pzale	piazzale
+cso	corso
+lgo	largo
+vlo	vicolo
+vic	vicolo
+lungot	lungotevere
+loc	localita
+fraz	frazione
+ss	strada statale
+sp	strada provinciale
+# Spanish / Portuguese
+c	calle
+cl	calle
+avda	avenida
+ctra	carretera
+po	paseo
+pso	paseo
+pza	plaza
+pca	praca
+tv	travessa
+trav	travessa|traversa
+est	estrada
+rod	rodovia

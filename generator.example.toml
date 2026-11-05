@@ -1,0 +1,46 @@
+# geobox-generator configuration. Every key is optional (defaults shown) and can be
+# overridden with an environment variable GEOBOX_<KEY>, e.g. GEOBOX_PLANET_URL=...
+
+# Input: an http(s) URL (a "<url>.md5" file must exist next to it) or a local .osm.pbf path.
+planet_url = "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
+
+# Checkpoints and intermediate files (planet: ~13 GB). Safe to delete between runs.
+work_dir = "work"
+
+# What you publish: manifest.tsv, tiles/, bundles/.
+output_dir = "data"
+
+# Run after a successful build; empty = don't publish. Runs through `sh -c` (`cmd /C` on Windows).
+publish_command = ""
+# publish_command = "uvx hf sync ./data hf://buckets/<you>/<bucket> --delete"
+# publish_command = "aws s3 sync ./data s3://<bucket> --delete --endpoint-url https://<endpoint>"
+# publish_command = "rclone sync ./data <remote>:<bucket>"
+publish_retries = 3
+
+# Region grid: 2^z x 2^z equirectangular cells. 8 = ~1.4 x 0.7 degrees, ~13k files for the planet.
+tile_zoom = 8
+
+# highway=* values that count as streets.
+highway_include = [
+  "motorway", "trunk", "primary", "secondary", "tertiary",
+  "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link",
+  "unclassified", "residential", "living_street", "service", "pedestrian", "track", "road",
+  "busway", "footway", "path", "cycleway", "steps", "bridleway",
+]
+
+# Extra name tags searched as alternative names; name_langs adds every name:<lang>.
+name_tags = ["alt_name", "old_name", "official_name", "short_name", "loc_name", "reg_name", "int_name"]
+name_langs = true
+ref_tags = ["ref", "int_ref"]
+
+# boundary=administrative levels used for place context. 2 = country, 3-5 = region/state,
+# the highest level >= 6 that contains a street is shown as its city.
+admin_levels = [2, 4, 6, 7, 8]
+# Place-name translations (name:<lang>) added to the searchable place text.
+place_langs = ["en"]
+
+# Checkpoint granularity (MB of compressed input per chunk), zstd level for tiles, worker threads
+# (0 = all cores).
+chunk_mb = 512
+zstd_level = 12
+threads = 0

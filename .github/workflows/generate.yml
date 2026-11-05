@@ -1,0 +1,36 @@
+name: generate data
+
+# Manual only. The full planet (~90 GB input) needs a large runner: standard hosted runners
+# have ~14 GB disk and the generator stops in its preflight check. Use a regional extract
+# (e.g. https://download.geofabrik.de/europe/monaco-latest.osm.pbf) on ubuntu-latest.
+on:
+  workflow_dispatch:
+    inputs:
+      planet_url:
+        description: "PBF URL (a <url>.md5 must exist next to it)"
+        default: "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
+      runner:
+        description: "runs-on label (planet: a large or self-hosted runner)"
+        default: "ubuntu-latest"
+
+jobs:
+  generate:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p geobox-generator
+      - run: ./target/release/geobox-generator
+        env:
+          GEOBOX_PLANET_URL: ${{ inputs.planet_url }}
+          GEOBOX_WORK_DIR: work
+          GEOBOX_OUTPUT_DIR: data
+          GEOBOX_PUBLISH_COMMAND: ""
+      - uses: actions/upload-artifact@v4
+        with:
+          name: geobox-data-${{ github.run_id }}
+          path: data/
+          retention-days: 1
+          compression-level: 0 # tiles are already zstd-compressed

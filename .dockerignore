@@ -1,0 +1,8 @@
+target
+work
+data
+server-data
+*.pbf
+*.pbf.*
+*.log
+.git

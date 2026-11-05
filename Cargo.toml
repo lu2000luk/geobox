@@ -1,0 +1,8 @@
+﻿[workspace]
+resolver = "3"
+members = ["core", "generator", "server", "bench"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"

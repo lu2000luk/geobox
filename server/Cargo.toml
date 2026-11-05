@@ -1,0 +1,31 @@
+[package]
+name = "geobox-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+blake3 = "1.8.7"
+futures-util = "0.3.34"
+geobox-core = { version = "0.1.0", path = "../core" }
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+mimalloc = "0.1.52"
+moka = { version = "0.12.16", features = ["sync"] }
+parking_lot = "0.13.0"
+reqwest = { version = "0.13.5", features = ["stream"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tantivy = "0.27.0"
+tar = "0.4.46"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+tower-http = { version = "0.7.1", features = ["timeout", "compression-gzip", "cors", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+zstd = "0.14.3"
+
+[dev-dependencies]
+tempfile = "3.27.0"
