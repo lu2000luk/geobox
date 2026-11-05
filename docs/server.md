@@ -1,10 +1,12 @@
 # Server
 
 `geobox-server` keeps a local search index in sync with published data and answers searches
-over HTTP. It needs no credentials, only a public URL (or a local folder).
+over HTTP. It needs no credentials, only a public URL (or a local folder). With no
+configuration it serves the public world data set:
 
 ```sh
-GEOBOX_BASE_URL=https://huggingface.co/buckets/lu2000luk/world/resolve geobox-server
+geobox-server                                   # = GEOBOX_BASE_URL=https://huggingface.co/buckets/lu2000luk/world/resolve
+GEOBOX_BASE_URL=./data geobox-server            # your own data, from a folder or URL
 ```
 
 On start it opens the local index (if any) and serves right away. A background task then syncs.
@@ -17,7 +19,7 @@ All settings are environment variables.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GEOBOX_BASE_URL` | **required** | Where `manifest.tsv` is published: `https://…` or a local directory |
+| `GEOBOX_BASE_URL` | `https://huggingface.co/buckets/lu2000luk/world/resolve` | Where `manifest.tsv` is published: `https://…` or a local directory. The default is the public world data set |
 | `GEOBOX_DATA_DIR` | `server-data` | Local index and sync state (planet: ~3.3 GB during the first sync, 2.7 GB after) |
 | `GEOBOX_BIND` | `0.0.0.0:8080` | Listen address |
 | `GEOBOX_POLL_SECS` | `3600` | How often to check the manifest (conditional GET: nearly free when unchanged) |

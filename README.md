@@ -35,7 +35,7 @@ GET /v1/search?q=hauptstr berlin
 **Option A: use the data that is already published** (no generator needed):
 
 ```sh
-GEOBOX_BASE_URL=https://huggingface.co/buckets/lu2000luk/world/resolve geobox-server
+geobox-server     # no config needed: defaults to the public world data set
 # first start: downloads ~560 MB in 60 files and builds a ~2.7 GB index, which takes a few minutes
 curl "http://localhost:8080/v1/search?q=central%20park%20west%20new%20york"
 ```

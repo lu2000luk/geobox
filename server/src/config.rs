@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::str::FromStr;
 
+/// The public world data set, used when `GEOBOX_BASE_URL` is not set.
+pub const DEFAULT_BASE_URL: &str = "https://huggingface.co/buckets/lu2000luk/world/resolve";
+
 /// Server settings, read from `GEOBOX_*` env vars (see README for the full list).
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -36,7 +39,7 @@ pub struct Weights {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            base_url: String::new(),
+            base_url: DEFAULT_BASE_URL.into(),
             data_dir: "server-data".into(),
             bind: "0.0.0.0:8080".into(),
             poll_secs: 3600,
@@ -84,7 +87,7 @@ impl Config {
                 class: env("W_CLASS", d.weights.class)?,
             },
         };
-        anyhow::ensure!(!c.base_url.is_empty(), "GEOBOX_BASE_URL is required (public data URL or local directory)");
+        anyhow::ensure!(!c.base_url.is_empty(), "GEOBOX_BASE_URL is empty (unset it to use {DEFAULT_BASE_URL})");
         anyhow::ensure!(
             c.search_threads > 0 && c.writer_mb >= 16,
             "GEOBOX_SEARCH_THREADS must be > 0 and GEOBOX_WRITER_MB >= 16"
