@@ -1,0 +1,29 @@
+# Railway server image with the index baked in at build time (no download on deploy).
+# Railway: set the service's Dockerfile path to `DockerfileRailway` (or RAILWAY_DOCKERFILE_PATH).
+# Optional build-time variables: GEOBOX_BASE_URL (defaults to the public world data set).
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked -p geobox-server
+
+# Run the server once until its first sync succeeds (prebuilt index installed, tiles applied,
+# segments merged), then stop it. Railway volumes aren't mounted at build time, so the data lives in the image.
+FROM build AS data
+# an ARG nobody sets stays out of the environment, so the server falls back to its default URL
+ARG GEOBOX_BASE_URL
+RUN set -e; \
+    GEOBOX_DATA_DIR=/data GEOBOX_BIND=127.0.0.1:8080 target/release/geobox-server & pid=$!; \
+    until curl -fs 127.0.0.1:8080/metrics | grep -q '^geobox_last_sync_success_timestamp_seconds'; do \
+        kill -0 $pid; sleep 10; \
+    done; \
+    kill $pid; wait $pid
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/geobox-server /usr/local/bin/geobox-server
+COPY --from=data /data /data
+# no VOLUME: Railway rejects it; attach a Railway volume at /data only if you want to keep runtime syncs across deploys
+ENV GEOBOX_DATA_DIR=/data
+EXPOSE 8080
+# Railway injects PORT; the server keeps syncing changed tiles at runtime (GEOBOX_POLL_SECS)
+CMD ["sh", "-c", "GEOBOX_BIND=0.0.0.0:${PORT:-8080} exec geobox-server"]
