@@ -145,7 +145,13 @@ impl Index {
         }
         std::fs::create_dir_all(&dir)?;
         let (schema, f) = schema();
-        let index = tantivy::Index::open_or_create(MmapDirectory::open(&dir)?, schema)?;
+        // Searches touch a few small spots of a multi-GB index; default readahead pulls ~128 KB around
+        // each one, filling the page cache (and the container's memory graph) with bytes never read.
+        #[cfg(unix)]
+        let mmap = MmapDirectory::open_with_madvice(&dir, tantivy::directory::Advice::Random)?;
+        #[cfg(not(unix))]
+        let mmap = MmapDirectory::open(&dir)?;
+        let index = tantivy::Index::open_or_create(mmap, schema)?;
         index.tokenizers().register(text::TOKENIZER, text::analyzer());
         index.tokenizers().register(text::WS_TOKENIZER, tantivy::tokenizer::WhitespaceTokenizer::default());
         let reader = index
@@ -214,5 +220,30 @@ impl Index {
 
     pub fn data_dir(&self) -> &Path {
         &self.cfg.data_dir
+    }
+
+    /// Hands back the index pages searches pulled into memory; they are re-read from disk on demand.
+    /// The kernel would evict these clean pages under pressure anyway, but until then they count as
+    /// the process's (container's) memory. Returns the bytes of mappings advised.
+    #[cfg(target_os = "linux")]
+    pub fn release_memory(&self) -> std::io::Result<usize> {
+        let dir = std::fs::canonicalize(self.cfg.data_dir.join("index"))?;
+        let mut released = 0;
+        for line in std::fs::read_to_string("/proc/self/maps")?.lines() {
+            // "start-end perms offset dev inode      path"
+            let mut parts = line.splitn(6, ' ');
+            let (Some(range), Some(path)) = (parts.next(), parts.nth(4)) else { continue };
+            if !Path::new(path.trim_start()).starts_with(&dir) {
+                continue;
+            }
+            let Some((a, b)) = range.split_once('-') else { continue };
+            let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else { continue };
+            // SAFETY: MADV_PAGEOUT never changes memory contents, it only lets the kernel reclaim the
+            // pages now; a range unmapped meanwhile just fails with ENOMEM.
+            if unsafe { libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_PAGEOUT) } == 0 {
+                released += b - a;
+            }
+        }
+        Ok(released)
     }
 }

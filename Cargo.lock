@@ -859,6 +859,7 @@ dependencies = [
  "blake3",
  "futures-util",
  "geobox-core",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "mimalloc",

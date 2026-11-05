@@ -12,8 +12,14 @@ use geobox_server::{Config, Index, Query, SearchError};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::Deserialize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
+
+/// Unix seconds of the last search or sync: the index pages they touched are released once idle.
+static LAST_ACTIVITY: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+const IDLE_RELEASE_SECS: u64 = 300;
 
 const ATTRIBUTION: &str = "Data © OpenStreetMap contributors, ODbL (https://www.openstreetmap.org/copyright)";
 
@@ -64,7 +70,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         let sync_index = index;
         let mut backoff = Duration::from_secs(30);
         loop {
-            let wait = match sync_index.sync().await {
+            let result = sync_index.sync().await;
+            LAST_ACTIVITY.store(unix_now() as u64, Ordering::Relaxed);
+            let wait = match result {
                 Ok(r) if r.failed == 0 => {
                     backoff = Duration::from_secs(30);
                     metrics::gauge!("geobox_last_sync_success_timestamp_seconds").set(unix_now());
@@ -85,6 +93,28 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             tokio::time::sleep(wait).await;
         }
     });
+
+    #[cfg(target_os = "linux")]
+    {
+        let cell = cell.clone();
+        tokio::spawn(async move {
+            let mut released_for = 0;
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let last = LAST_ACTIVITY.load(Ordering::Relaxed);
+                let Some(index) = cell.get().cloned() else { continue };
+                if last == released_for || (unix_now() as u64) < last + IDLE_RELEASE_SECS {
+                    continue;
+                }
+                released_for = last;
+                match tokio::task::spawn_blocking(move || index.release_memory()).await {
+                    Ok(Ok(n)) => info!("idle: released index pages ({} MB of mappings)", n >> 20),
+                    Ok(Err(e)) => warn!("idle: cannot release index pages: {e}"),
+                    Err(e) => warn!("idle: release task failed: {e}"),
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/v1/search", get(search))
@@ -145,6 +175,7 @@ async fn search(
     params: Result<QueryParams<SearchParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let started = Instant::now();
+    LAST_ACTIVITY.store(unix_now() as u64, Ordering::Relaxed);
     let Ok(QueryParams(p)) = params else { return error(StatusCode::BAD_REQUEST, "invalid query parameters") };
     let q = p.q.unwrap_or_default();
     if q.trim().is_empty() || q.chars().count() > 200 {
