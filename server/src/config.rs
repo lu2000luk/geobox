@@ -17,6 +17,9 @@ pub struct Config {
     pub search_threads: usize,
     pub queue_factor: usize,
     pub cache_mb: u64,
+    /// Resident file pages (index + code) kept before they are paged out; searches re-read them
+    /// from disk. Without this the kernel keeps every page a search touched until memory runs out.
+    pub page_cache_mb: u64,
     pub writer_mb: usize,
     pub docstore_cache_blocks: usize,
     pub download_concurrency: usize,
@@ -45,9 +48,12 @@ impl Default for Config {
             data_dir: "server-data".into(),
             bind: "0.0.0.0:8080".into(),
             poll_secs: 3600,
-            search_threads: std::thread::available_parallelism().map_or(2, |n| n.get()),
+            // at least 4: a search waiting on the disk (index pages not in memory) leaves the CPU idle,
+            // and with one thread on 1 vCPU those waits turned away ~20% of requests at 100 req/s
+            search_threads: std::thread::available_parallelism().map_or(4, |n| n.get().max(4)),
             queue_factor: 4,
-            cache_mb: 32,
+            cache_mb: 8,
+            page_cache_mb: 24,
             writer_mb: 64,
             docstore_cache_blocks: 16,
             download_concurrency: 8,
@@ -78,6 +84,7 @@ impl Config {
             search_threads: env("SEARCH_THREADS", d.search_threads)?,
             queue_factor: env("QUEUE_FACTOR", d.queue_factor)?,
             cache_mb: env("CACHE_MB", d.cache_mb)?,
+            page_cache_mb: env("PAGE_CACHE_MB", d.page_cache_mb)?,
             writer_mb: env("WRITER_MB", d.writer_mb)?,
             docstore_cache_blocks: env("DOCSTORE_CACHE_BLOCKS", d.docstore_cache_blocks)?,
             download_concurrency: env("DOWNLOAD_CONCURRENCY", d.download_concurrency)?,

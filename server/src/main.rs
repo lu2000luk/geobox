@@ -16,10 +16,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
-/// Unix seconds of the last search or sync: the index pages they touched are released once idle.
+/// `uptime_secs` of the last search or sync: memory is released once idle.
 static LAST_ACTIVITY: AtomicU64 = AtomicU64::new(0);
+/// Searches received, for the request rate that sizes the page budget.
+static SEARCHES: AtomicU64 = AtomicU64::new(0);
+/// `uptime_secs` of the last search shed as overloaded: no trimming then, re-reading pages from
+/// disk must never be what turns requests away.
+static LAST_OVERLOAD: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
-const IDLE_RELEASE_SECS: u64 = 300;
+const IDLE_RELEASE_SECS: u64 = 30;
+/// Extra resident index pages allowed per request/second (averaged over 10 s), up to the cap: a busy
+/// server would spend its time re-reading pages from disk otherwise. ~50 MB at 5 req/s, ~200 MB at
+/// 40, the cap at 100 (where an uncapped planet server keeps ~470 MB cached).
+#[cfg(target_os = "linux")]
+const PAGES_PER_RPS: u64 = 9 << 19; // 4.5 MB
+#[cfg(target_os = "linux")]
+const PAGES_MAX: u64 = 448 << 20;
 
 const ATTRIBUTION: &str = "Data © OpenStreetMap contributors, ODbL (https://www.openstreetmap.org/copyright)";
 
@@ -31,6 +43,12 @@ struct App {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Allocate from the OS directly instead of mimalloc's arenas, which keep memory committed after it
+    // is freed (idle: ~20 MB -> ~12 MB; the images also set MIMALLOC_DISALLOW_ARENA_ALLOC=1, which
+    // applies before main and gets ~8 MB). 26 = mi_option_disallow_arena_alloc (v3 keeps option
+    // numbers stable; libmimalloc-sys does not export this one).
+    // SAFETY: plain FFI call, before any other thread exists
+    unsafe { libmimalloc_sys::mi_option_set(26, 1) };
     tracing_subscriber::fmt().with_target(false).with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout())).init();
     let cfg = Config::from_env()?;
     // Few async threads: searches run on the blocking pool sized by `search_threads`.
@@ -47,6 +65,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         .set_buckets(&[0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0])?
         .install_recorder()?;
     let bind = cfg.bind.clone();
+    #[cfg(target_os = "linux")]
+    let page_budget = cfg.page_cache_mb << 20;
     let poll = Duration::from_secs(cfg.poll_secs.max(10));
     // Serve (health checks, 503 for searches) right away; the index arrives in the background.
     let cell: Arc<std::sync::OnceLock<Arc<Index>>> = Arc::default();
@@ -71,7 +91,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         let mut backoff = Duration::from_secs(30);
         loop {
             let result = sync_index.sync().await;
-            LAST_ACTIVITY.store(unix_now() as u64, Ordering::Relaxed);
+            LAST_ACTIVITY.store(uptime_secs(), Ordering::Relaxed);
             let wait = match result {
                 Ok(r) if r.failed == 0 => {
                     backoff = Duration::from_secs(30);
@@ -96,21 +116,48 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        // The kernel keeps every index page a search touched until memory runs out. Trim them to a
+        // budget that grows with the request rate, and drop everything (pages, caches, freed heap)
+        // once idle.
         let cell = cell.clone();
         tokio::spawn(async move {
-            let mut released_for = 0;
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let mut counts = std::collections::VecDeque::from([0; 10]);
+            // MAX: what startup touched is released too
+            let mut released_for = u64::MAX;
             loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                let last = LAST_ACTIVITY.load(Ordering::Relaxed);
+                tick.tick().await;
+                let searches = SEARCHES.load(Ordering::Relaxed);
+                let rps = (searches - counts.pop_front().unwrap_or(0)) / 10;
+                counts.push_back(searches);
                 let Some(index) = cell.get().cloned() else { continue };
-                if last == released_for || (unix_now() as u64) < last + IDLE_RELEASE_SECS {
+                let last = LAST_ACTIVITY.load(Ordering::Relaxed);
+                let idle = last != released_for && uptime_secs() >= last + IDLE_RELEASE_SECS;
+                let overloaded = uptime_secs() < LAST_OVERLOAD.load(Ordering::Relaxed) + 10;
+                let max = PAGES_MAX.max(page_budget);
+                let budget = if overloaded { max } else { (page_budget + rps * PAGES_PER_RPS).min(max) };
+                if !idle && geobox_server::resident_file_bytes() <= budget {
                     continue;
                 }
-                released_for = last;
-                match tokio::task::spawn_blocking(move || index.release_memory()).await {
-                    Ok(Ok(n)) => info!("idle: released index pages ({} MB of mappings)", n >> 20),
-                    Ok(Err(e)) => warn!("idle: cannot release index pages: {e}"),
-                    Err(e) => warn!("idle: release task failed: {e}"),
+                if idle {
+                    released_for = last;
+                }
+                let released = tokio::task::spawn_blocking(move || {
+                    if !idle {
+                        // a quarter below the budget, so this does not run again on the next tick
+                        return index.trim_memory(budget / 4 * 3);
+                    }
+                    let r = index.release_memory();
+                    // SAFETY: plain FFI call; returns freed heap memory to the OS
+                    unsafe { libmimalloc_sys::mi_collect(true) };
+                    r
+                })
+                .await;
+                match released {
+                    Ok(Ok(())) if idle => info!("idle: released memory"),
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("cannot release index pages: {e}"),
+                    Err(e) => warn!("memory release task failed: {e}"),
                 }
             }
         });
@@ -139,6 +186,12 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     axum::serve(listener, app).with_graceful_shutdown(shutdown()).await?;
     info!("shut down");
     Ok(())
+}
+
+/// Seconds since start on a monotonic clock (wall-clock jumps must not delay the idle release).
+fn uptime_secs() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs()
 }
 
 fn unix_now() -> f64 {
@@ -175,7 +228,8 @@ async fn search(
     params: Result<QueryParams<SearchParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let started = Instant::now();
-    LAST_ACTIVITY.store(unix_now() as u64, Ordering::Relaxed);
+    LAST_ACTIVITY.store(uptime_secs(), Ordering::Relaxed);
+    SEARCHES.fetch_add(1, Ordering::Relaxed);
     let Ok(QueryParams(p)) = params else { return error(StatusCode::BAD_REQUEST, "invalid query parameters") };
     let q = p.q.unwrap_or_default();
     if q.trim().is_empty() || q.chars().count() > 200 {
@@ -214,7 +268,10 @@ async fn search(
     let result = index.search(Query { q, point, limit, lang: p.lang }).await;
     let status = match &result {
         Ok(_) => "ok",
-        Err(SearchError::Overloaded) => "overloaded",
+        Err(SearchError::Overloaded) => {
+            LAST_OVERLOAD.store(uptime_secs(), Ordering::Relaxed);
+            "overloaded"
+        }
         Err(_) => "error",
     };
     metrics::counter!("geobox_search_requests_total", "status" => status).increment(1);

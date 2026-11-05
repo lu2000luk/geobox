@@ -23,7 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=build /src/target/release/geobox-server /usr/local/bin/geobox-server
 COPY --from=data /data /data
 # no VOLUME: Railway rejects it; attach a Railway volume at /data only if you want to keep runtime syncs across deploys
-ENV GEOBOX_DATA_DIR=/data
+# mimalloc: allocate from the OS, not arenas that stay committed (idle RAM; main.rs sets it too, but later)
+ENV GEOBOX_DATA_DIR=/data MIMALLOC_DISALLOW_ARENA_ALLOC=1
 EXPOSE 8080
 # Railway injects PORT; the server keeps syncing changed tiles at runtime (GEOBOX_POLL_SECS)
 CMD ["sh", "-c", "GEOBOX_BIND=0.0.0.0:${PORT:-8080} exec geobox-server"]

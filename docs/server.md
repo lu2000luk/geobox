@@ -26,9 +26,10 @@ All settings are environment variables.
 | `GEOBOX_DATA_DIR` | `server-data` | Local index and sync state (planet: ~3.3 GB during the first sync, 2.7 GB after) |
 | `GEOBOX_BIND` | `0.0.0.0:8080` | Listen address |
 | `GEOBOX_POLL_SECS` | `3600` | How often to check the manifest (conditional GET: nearly free when unchanged) |
-| `GEOBOX_SEARCH_THREADS` | CPU count | Searches run in parallel |
+| `GEOBOX_SEARCH_THREADS` | CPU count, at least 4 | Searches run in parallel (more than the CPUs, so searches waiting on disk don't idle the CPU) |
 | `GEOBOX_QUEUE_FACTOR` | `4` | Up to `threads × factor` more may wait; beyond that requests get 503 at once |
-| `GEOBOX_CACHE_MB` | `32` | Result cache (repeated queries from nearby users are answered in <1 ms) |
+| `GEOBOX_CACHE_MB` | `8` | Result cache (repeated queries from nearby users are answered in <1 ms) |
+| `GEOBOX_PAGE_CACHE_MB` | `24` | Index and code pages kept in memory (Linux), plus 4.5 MB per request/s up to 448 MB (the cap right away while requests are being shed). Beyond that they are dropped and re-read from disk; after 30 s idle everything is dropped (see [memory](#memory)) |
 | `GEOBOX_WRITER_MB` | `64` | Indexing memory, allocated only during a sync (min 16) |
 | `GEOBOX_DOCSTORE_CACHE_BLOCKS` | `16` | Cached blocks of stored results |
 | `GEOBOX_DOWNLOAD_CONCURRENCY` | `8` | Parallel tile downloads (bundles: 2 at a time) |
@@ -72,12 +73,25 @@ Measured on the full planet. Details are in [benchmarks.md](benchmarks.md).
 
 | | |
 |---|---|
-| Idle | ~20 MB RAM, 0% CPU (one manifest check per hour) |
+| Idle | ~10 MB process RSS (~20 MB container) 30 s after the last search, 0% CPU (one manifest check per hour) |
 | Searching, 100 req/s uncached | ~0.25 CPU core; p99 31–34 ms |
 | First sync (2 CPUs, 1 GB limit) | peak ~470 MB |
 
-The index is memory-mapped: its pages live in the OS file cache, not in the process. Under a
-memory limit the OS keeps the hot parts cached. Give it fast storage (SSD/NVMe).
+### Memory
+
+The index is memory-mapped: its pages live in the OS file cache. Left alone, the kernel keeps every
+page a search touched until the container's limit is reached, and they all count as the
+container's memory. On Linux the server bounds them itself:
+
+- **Under load**: resident index pages are kept under `GEOBOX_PAGE_CACHE_MB` plus 4.5 MB per
+  request/s (averaged over 10 s, capped at 448 MB): ~50 MB at 5 req/s, ~200 MB at 40. Beyond that,
+  pages are dropped and re-read from disk when needed. While any search is being shed (`503`), the
+  budget is the cap, so trimming never costs throughput. When traffic drops, the budget shrinks
+  within ~10 s.
+- **Idle** (30 s without searches): the pages, the result cache and freed heap memory are all
+  handed back to the OS.
+
+Give it fast storage (SSD/NVMe): searches read from disk more often under the budget.
 
 **Load shedding**: when more than `threads × (factor + 1)` searches are in flight, new ones get
 `503` with `Retry-After: 1` immediately instead of queueing. Latency stays bounded and memory stays flat.

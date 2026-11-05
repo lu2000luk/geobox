@@ -4,12 +4,16 @@
 
 pub mod config;
 mod fetch;
+#[cfg(target_os = "linux")]
+mod mem;
 mod search;
 mod snapshot;
 mod sync;
 mod text;
 
 pub use config::{Config, Weights};
+#[cfg(target_os = "linux")]
+pub use mem::resident_file_bytes;
 pub use search::{Hit, Query};
 pub use snapshot::{add_to_manifest, bootstrap, build_snapshot};
 pub use sync::SyncReport;
@@ -24,7 +28,7 @@ use tantivy::directory::MmapDirectory;
 use tantivy::schema::{
     Field, INDEXED, IndexRecordOption, NumericOptions, STORED, Schema, TextFieldIndexing, TextOptions,
 };
-use tantivy::{IndexReader, ReloadPolicy};
+use tantivy::{IndexReader, ReloadPolicy, Searcher};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
@@ -112,8 +116,10 @@ pub(crate) struct Applied {
 pub struct Index {
     pub(crate) cfg: Config,
     pub(crate) index: tantivy::Index,
-    pub(crate) reader: IndexReader,
-    /// Fast-field columns per segment of the current searcher (refreshed by `reload`).
+    /// Closed when idle (unmapping the index), reopened by the next search.
+    pub(crate) reader: Mutex<Option<IndexReader>>,
+    /// Fast-field columns per segment of the current searcher (loaded by the first search,
+    /// refreshed by `reload`, dropped when idle).
     pub(crate) columns: parking_lot::RwLock<search::ColumnCache>,
     pub(crate) f: Fields,
     pub(crate) abbrev: text::Abbrev,
@@ -126,6 +132,17 @@ pub struct Index {
     pub(crate) permits: Arc<tokio::sync::Semaphore>,
     pub(crate) queued: AtomicUsize,
     pub(crate) fetcher: fetch::Fetcher,
+    /// Where `trim_memory` stopped paging out (an address in the index mappings).
+    #[cfg(target_os = "linux")]
+    pub(crate) trim_cursor: AtomicUsize,
+}
+
+fn open_reader(index: &tantivy::Index, cfg: &Config) -> Result<IndexReader> {
+    Ok(index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .doc_store_cache_num_blocks(cfg.docstore_cache_blocks)
+        .try_into()?)
 }
 
 impl Index {
@@ -154,11 +171,7 @@ impl Index {
         let index = tantivy::Index::open_or_create(mmap, schema)?;
         index.tokenizers().register(text::TOKENIZER, text::analyzer());
         index.tokenizers().register(text::WS_TOKENIZER, tantivy::tokenizer::WhitespaceTokenizer::default());
-        let reader = index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .doc_store_cache_num_blocks(cfg.docstore_cache_blocks)
-            .try_into()?;
+        let reader = open_reader(&index, &cfg)?;
         let abbrev = match &cfg.abbrev_file {
             Some(p) => text::Abbrev::parse(&std::fs::read_to_string(p)?),
             None => text::Abbrev::parse(include_str!("../abbrev.tsv")),
@@ -173,14 +186,14 @@ impl Index {
         // manifest metadata is saved only when a sync round finishes, so a server restarted in the
         // middle of its first sync stays "not ready" until that sync completes
         let ready = !applied.meta.is_empty();
-        let columns = parking_lot::RwLock::new(search::load_columns(&reader.searcher()));
         Ok(Arc::new(Index {
-            columns,
+            // loaded by the first search
+            columns: Default::default(),
             permits: Arc::new(tokio::sync::Semaphore::new(cfg.search_threads)),
             fetcher: fetch::Fetcher::new(&cfg.base_url)?,
             cfg,
             index,
-            reader,
+            reader: Mutex::new(Some(reader)),
             f,
             abbrev,
             cache,
@@ -190,14 +203,32 @@ impl Index {
             manifest_etag: Mutex::new(None),
             sync_lock: tokio::sync::Mutex::new(()),
             queued: AtomicUsize::new(0),
+            #[cfg(target_os = "linux")]
+            trim_cursor: AtomicUsize::new(0),
         }))
     }
 
     /// Makes committed changes searchable (and refreshes the cached columns).
     pub(crate) fn reload(&self) -> Result<()> {
-        self.reader.reload()?;
-        *self.columns.write() = search::load_columns(&self.reader.searcher());
+        let reader = self.reader.lock().clone();
+        // a closed reader reopens on the latest commit anyway
+        *self.columns.write() = match reader {
+            Some(r) => {
+                r.reload()?;
+                search::load_columns(&r.searcher())
+            }
+            None => Default::default(),
+        };
         Ok(())
+    }
+
+    /// The current searcher, reopening the index if it was closed while idle.
+    pub(crate) fn searcher(&self) -> Result<Searcher> {
+        let mut reader = self.reader.lock();
+        if reader.is_none() {
+            *reader = Some(open_reader(&self.index, &self.cfg)?);
+        }
+        Ok(reader.as_ref().expect("just opened").searcher())
     }
 
     /// True once a full data set is loaded (after the first successful sync).
@@ -210,7 +241,7 @@ impl Index {
     }
 
     pub fn road_count(&self) -> u64 {
-        self.reader.searcher().num_docs()
+        self.searcher().map_or(0, |s| s.num_docs())
     }
 
     /// Manifest metadata of the applied data (e.g. `osm_timestamp`).
@@ -222,28 +253,50 @@ impl Index {
         &self.cfg.data_dir
     }
 
-    /// Hands back the index pages searches pulled into memory; they are re-read from disk on demand.
-    /// The kernel would evict these clean pages under pressure anyway, but until then they count as
-    /// the process's (container's) memory. Returns the bytes of mappings advised.
+    /// Drops what an idle server can: cached results and columns, the open index (its mappings and
+    /// their page tables), and every file page still mapped (code). All of it comes back on demand.
     #[cfg(target_os = "linux")]
-    pub fn release_memory(&self) -> std::io::Result<usize> {
+    pub fn release_memory(&self) -> std::io::Result<()> {
+        // paged out while still mapped: once unmapped, the pages would linger as plain file cache
+        let maps = mem::file_mappings(None)?;
+        for (a, b, _) in &maps {
+            mem::page_out(*a, *b);
+        }
+        // a sync holds its own searchers; they unmap when it finishes
+        *self.reader.lock() = None;
+        *self.columns.write() = Default::default();
+        self.cache.invalidate_all();
+        self.cache.run_pending_tasks();
+        let dirs = [self.cfg.data_dir.clone(), self.cfg.data_dir.join("index")];
+        let data = dirs.iter().filter_map(|d| std::fs::read_dir(d).ok()).flatten().flatten().map(|e| e.path());
+        let mut files: Vec<_> = maps.into_iter().map(|m| m.2).chain(data).collect();
+        files.sort();
+        files.dedup();
+        for f in files {
+            mem::drop_cached(&f);
+        }
+        Ok(())
+    }
+
+    /// Pages out index pages until at most `target` bytes of file pages stay resident. It sweeps on
+    /// from where the last call stopped, so pages that many searches share survive a while.
+    #[cfg(target_os = "linux")]
+    pub fn trim_memory(&self, target: u64) -> std::io::Result<()> {
+        const CHUNK: usize = 64 << 20;
         let dir = std::fs::canonicalize(self.cfg.data_dir.join("index"))?;
-        let mut released = 0;
-        for line in std::fs::read_to_string("/proc/self/maps")?.lines() {
-            // "start-end perms offset dev inode      path"
-            let mut parts = line.splitn(6, ' ');
-            let (Some(range), Some(path)) = (parts.next(), parts.nth(4)) else { continue };
-            if !Path::new(path.trim_start()).starts_with(&dir) {
-                continue;
-            }
-            let Some((a, b)) = range.split_once('-') else { continue };
-            let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else { continue };
-            // SAFETY: MADV_PAGEOUT never changes memory contents, it only lets the kernel reclaim the
-            // pages now; a range unmapped meanwhile just fails with ENOMEM.
-            if unsafe { libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_PAGEOUT) } == 0 {
-                released += b - a;
+        let chunks: Vec<(usize, usize)> = mem::file_mappings(Some(&dir))?
+            .into_iter()
+            .flat_map(|(a, b, _)| (a..b).step_by(CHUNK).map(move |c| (c, (c + CHUNK).min(b))))
+            .collect();
+        let cursor = self.trim_cursor.load(Ordering::Relaxed);
+        let start = chunks.iter().position(|&(a, _)| a >= cursor).unwrap_or(0);
+        for &(a, b) in chunks[start..].iter().chain(&chunks[..start]) {
+            mem::page_out(a, b);
+            self.trim_cursor.store(b, Ordering::Relaxed);
+            if mem::resident_file_bytes() <= target {
+                break;
             }
         }
-        Ok(released)
+        Ok(())
     }
 }

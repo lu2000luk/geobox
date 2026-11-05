@@ -174,7 +174,7 @@ impl Index {
     fn run(&self, q: &Query, point: Option<(f64, f64)>, want: usize, ends_open: bool) -> Result<Vec<Hit>> {
         // a few extra, so the list is still full after merging duplicate pieces of one street
         let limit = want + want / 2 + 2;
-        let searcher = self.reader.searcher();
+        let searcher = self.searcher()?;
         let mut analyzer = text::analyzer();
         let started = std::time::Instant::now();
         SEARCH_LOG.with(|l| l.borrow_mut().clear());
@@ -490,7 +490,15 @@ impl Index {
         limit: usize,
     ) -> Result<Vec<(f32, DocAddress)>> {
         let w = self.cfg.weights;
-        let cols = self.columns.read().clone();
+        // dropped when idle (see `release_memory`): reopen once, not per search
+        let mut cols = self.columns.read().clone();
+        if cols.is_empty() {
+            cols = load_columns(searcher);
+            let mut slot = self.columns.write();
+            if slot.is_empty() {
+                *slot = cols.clone();
+            }
+        }
         let collector = TopDocs::with_limit(limit).tweak_score(move |seg: &SegmentReader| {
             let SegColumns { lat, lon, class } =
                 cols.get(&seg.segment_id()).cloned().unwrap_or_else(|| SegColumns::open(seg));

@@ -24,7 +24,8 @@ FROM gcr.io/distroless/cc-debian12:nonroot AS server
 COPY --from=build /src/target/release/geobox-server /usr/local/bin/geobox-server
 # the image runs as uid 65532 ("nonroot"), so the data dir must belong to it
 COPY --from=build --chown=65532:65532 /data-empty /data
-ENV GEOBOX_DATA_DIR=/data GEOBOX_BIND=0.0.0.0:8080
+# mimalloc: allocate from the OS, not arenas that stay committed (idle RAM; main.rs sets it too, but later)
+ENV GEOBOX_DATA_DIR=/data GEOBOX_BIND=0.0.0.0:8080 MIMALLOC_DISALLOW_ARENA_ALLOC=1
 VOLUME /data
 EXPOSE 8080
 # probes: GET /healthz (alive) and /readyz (initial sync done)
