@@ -38,6 +38,14 @@ tile number, so a new or deleted tile never moves other tiles to a different bun
 deterministic (sorted entries, zero timestamps), so an unchanged bundle keeps its name. The planet
 has 60 bundles, from a few KB to ~130 MB.
 
+### Prebuilt index
+
+The generator's last stage indexes all tiles with the server's own code and publishes the result as
+`index/<version>-<hash>.tar.zst`: the index files plus the list of tiles they contain. The header
+of the manifest names it (`index_path`, `index_blake3`, `index_size`, `index_version`). A server
+starting without data installs it and only fetches tiles that changed afterwards. `index_version`
+must match the server's index format, otherwise the server builds the index from tiles.
+
 ### Manifest
 
 `manifest.tsv` is tab-separated UTF-8:

@@ -831,6 +831,7 @@ dependencies = [
  "bytemuck",
  "futures-util",
  "geobox-core",
+ "geobox-server",
  "hex",
  "md-5",
  "memmap2 0.9.12",

@@ -62,13 +62,14 @@ const EXACT_SCORE: f32 = 4.0;
 const PLACE_COMPLETIONS: usize = 8;
 const PLACE_COMPLETION_SCORE: f32 = 0.5;
 /// Look-alike words tried for a possibly misspelled word, and their score per field boost.
-const FUZZY_TERMS: usize = 6;
+const FUZZY_TERMS: usize = 32;
 const FUZZY_SCORE: f32 = 1.0;
 const FUZZY_MAX_DF: u64 = 200;
 /// With only very common words, text scores barely differ: skip the extra (wider) ring.
 const EXTRA_RING_MAX_DF: u64 = 50_000;
-/// Leaving out a word is pointless when only very common words would remain.
-const DROP_ONE_MAX_DF: u64 = 200_000;
+/// Leaving out a word is only allowed if a fairly specific word remains: "via di" (what is left of
+/// "via di casal boccone") matches streets everywhere and would return confident junk.
+const DROP_ONE_MAX_DF: u64 = 50_000;
 /// Below this many possible matches, one worldwide query is cheaper than ring search.
 const RING_MIN_MATCHES: u64 = 3_000;
 /// Ring search: 3x3 cells at these levels around the point, then the whole world.
@@ -170,18 +171,26 @@ impl Index {
         [self.f.name, self.f.alt, self.f.refs, self.f.place]
     }
 
-    fn run(&self, q: &Query, point: Option<(f64, f64)>, limit: usize, ends_open: bool) -> Result<Vec<Hit>> {
+    fn run(&self, q: &Query, point: Option<(f64, f64)>, want: usize, ends_open: bool) -> Result<Vec<Hit>> {
+        // a few extra, so the list is still full after merging duplicate pieces of one street
+        let limit = want + want / 2 + 2;
         let searcher = self.reader.searcher();
         let mut analyzer = text::analyzer();
         let started = std::time::Instant::now();
         SEARCH_LOG.with(|l| l.borrow_mut().clear());
         let mut words = text::tokens(&mut analyzer, &q.q);
         words.truncate(MAX_WORDS);
-        // exact-name bonus keys: all words, and the words without bare numbers ("via roma 12")
-        let mut exact = vec![text::exact_key(&words)];
+        // Exact-name bonus keys: the query without bare numbers ("via roma 12"), and every run of
+        // 2+ words at its start or end, so "central park west new york" still rewards the street
+        // named exactly "Central Park West" (and "berlin hauptstrasse" rewards "Hauptstraße").
         let no_numbers: Vec<String> = words.iter().filter(|w| !is_number(w)).cloned().collect();
-        if no_numbers.len() != words.len() && !no_numbers.is_empty() {
-            exact.push(text::exact_key(&no_numbers));
+        let mut exact = vec![text::exact_key(&words)];
+        for n in (2..=no_numbers.len()).rev() {
+            for key in [text::exact_key(&no_numbers[..n]), text::exact_key(&no_numbers[no_numbers.len() - n..])] {
+                if !exact.contains(&key) {
+                    exact.push(key);
+                }
+            }
         }
         let last = words.len().saturating_sub(1);
         let mut groups = Vec::new();
@@ -240,8 +249,11 @@ impl Index {
             add_tier(&mut scored, tier);
         }
         let t_tier3 = started.elapsed();
-        let hits: Result<Vec<Hit>> =
-            scored.into_iter().map(|(s, addr)| self.hit(&searcher, addr, s, q.lang.as_deref())).collect();
+        let hits = scored
+            .into_iter()
+            .map(|(s, addr)| self.hit(&searcher, addr, s, q.lang.as_deref()))
+            .collect::<Result<Vec<Hit>>>()
+            .map(|h| dedupe(h, want));
         let total = started.elapsed();
         if total.as_millis() as u64 >= self.cfg.slow_query_ms {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
@@ -550,6 +562,30 @@ impl Index {
             alt,
         })
     }
+}
+
+/// One street can be stored as several pieces when its segments are far apart in OSM (more than
+/// the generator's join distance). Same name + same place within this distance = one result.
+const SAME_STREET_M: f64 = 1_500.0;
+
+fn dedupe(hits: Vec<Hit>, want: usize) -> Vec<Hit> {
+    let e7 = |v: f64| (v * 1e7).round() as i32;
+    let mut out: Vec<Hit> = Vec::with_capacity(want);
+    for h in hits {
+        let dup = out.iter().any(|k| {
+            k.name == h.name
+                && k.refs == h.refs
+                && k.place == h.place
+                && haversine_m(e7(k.lat), e7(k.lon), e7(h.lat), e7(h.lon)) < SAME_STREET_M
+        });
+        if !dup {
+            out.push(h);
+            if out.len() == want {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Fast-field columns of one segment. Opening a column costs ~4 ms on a planet index, far more

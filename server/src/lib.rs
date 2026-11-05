@@ -3,12 +3,15 @@
 //! HTTP binary in this crate.
 
 pub mod config;
+mod fetch;
 mod search;
+mod snapshot;
 mod sync;
 mod text;
 
 pub use config::{Config, Weights};
 pub use search::{Hit, Query};
+pub use snapshot::{add_to_manifest, bootstrap, build_snapshot};
 pub use sync::SyncReport;
 
 use anyhow::Result;
@@ -32,7 +35,7 @@ pub enum SearchError {
 }
 
 /// Bump when the index schema or text processing changes.
-const INDEX_VERSION: &str = "2";
+pub const INDEX_VERSION: &str = "2";
 
 #[derive(Clone, Copy)]
 pub(crate) struct Fields {
@@ -119,12 +122,10 @@ pub struct Index {
     pub(crate) applied: Mutex<Applied>,
     pub(crate) ready: AtomicBool,
     pub(crate) manifest_etag: Mutex<Option<String>>,
-    /// Shared back-off: no download starts before this instant (set on HTTP 429).
-    pub(crate) download_pause: Mutex<Option<std::time::Instant>>,
     pub(crate) sync_lock: tokio::sync::Mutex<()>,
     pub(crate) permits: Arc<tokio::sync::Semaphore>,
     pub(crate) queued: AtomicUsize,
-    pub(crate) http: reqwest::Client,
+    pub(crate) fetcher: fetch::Fetcher,
 }
 
 impl Index {
@@ -163,15 +164,14 @@ impl Index {
             })
             .max_capacity(cfg.cache_mb << 20)
             .build();
-        let ready = !applied.tiles.is_empty();
+        // manifest metadata is saved only when a sync round finishes, so a server restarted in the
+        // middle of its first sync stays "not ready" until that sync completes
+        let ready = !applied.meta.is_empty();
         let columns = parking_lot::RwLock::new(search::load_columns(&reader.searcher()));
         Ok(Arc::new(Index {
             columns,
             permits: Arc::new(tokio::sync::Semaphore::new(cfg.search_threads)),
-            http: reqwest::Client::builder()
-                .user_agent("geobox-server")
-                .timeout(std::time::Duration::from_secs(300))
-                .build()?,
+            fetcher: fetch::Fetcher::new(&cfg.base_url)?,
             cfg,
             index,
             reader,
@@ -182,7 +182,6 @@ impl Index {
             applied: Mutex::new(applied),
             ready: AtomicBool::new(ready),
             manifest_etag: Mutex::new(None),
-            download_pause: Mutex::new(None),
             sync_lock: tokio::sync::Mutex::new(()),
             queued: AtomicUsize::new(0),
         }))

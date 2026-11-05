@@ -16,10 +16,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-const STAGES: [&str; 8] = ["index", "relations", "ways", "nodes", "merge", "borders", "tiles", "bundles"];
+const STAGES: [&str; 9] = ["index", "relations", "ways", "nodes", "merge", "borders", "tiles", "bundles", "snapshot"];
 
 const USAGE: &str = "usage: geobox-generator [--config <file.toml>] [--from-stage <stage>]
-stages: index relations ways nodes merge borders tiles bundles
+stages: index relations ways nodes merge borders tiles bundles snapshot
 every config key can be overridden with GEOBOX_<KEY> env vars";
 
 #[tokio::main]
@@ -230,6 +230,22 @@ async fn build(cfg: &Arc<Config>, pbf_path: &Path, md5: &str, from: Option<usize
 
     let out = cfg.output_dir.clone();
     stage(cfg, md5, "bundles", force("bundles"), move || bundles::run(&out)).await?;
+
+    // The search index servers would otherwise build themselves, published prebuilt.
+    let (out, build) = (cfg.output_dir.clone(), cfg.work_dir.join("snapshot").join("build"));
+    let writer_mb = cfg.index_writer_mb;
+    stage(cfg, md5, "snapshot", force("snapshot"), move || {
+        let rt = tokio::runtime::Handle::current();
+        let (path, hash, size) = rt.block_on(geobox_server::build_snapshot(&out, &build, writer_mb))?;
+        let _ = std::fs::remove_dir_all(&build);
+        let manifest_path = out.join("manifest.tsv");
+        let mut m =
+            geobox_core::Manifest::parse(&std::fs::read_to_string(&manifest_path)?).map_err(anyhow::Error::msg)?;
+        geobox_server::add_to_manifest(&mut m, &path, &hash, size);
+        info!("snapshot: {path} ({} MB)", size >> 20);
+        pbf::write_atomic(&manifest_path, m.to_tsv().as_bytes())
+    })
+    .await?;
     Ok(())
 }
 

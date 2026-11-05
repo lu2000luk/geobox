@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
 use tantivy::{IndexWriter, TantivyDocument, Term};
 use tracing::{info, warn};
 
@@ -24,10 +23,8 @@ pub struct SyncReport {
 
 const APPLIED_FILE: &str = "applied.tsv";
 const MAX_SEGMENTS: usize = 8;
-const MAX_ATTEMPTS: u32 = 10;
 /// Take the whole bundle when at least this many of its tiles changed (or a third of its bytes).
 const BUNDLE_MIN_TILES: usize = 50;
-const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 fn check_tile(e: &ManifestEntry, bytes: &[u8]) -> Result<()> {
     if bytes.len() as u64 != e.size || blake3::hash(bytes).to_hex().as_str() != e.file_hash {
@@ -67,135 +64,8 @@ fn save_applied(dir: &Path, a: &Applied) -> Result<()> {
 }
 
 impl Index {
-    fn is_http(&self) -> bool {
-        self.cfg.base_url.starts_with("http://") || self.cfg.base_url.starts_with("https://")
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("{}/{}", self.cfg.base_url.trim_end_matches('/'), path)
-    }
-
-    /// GET with retries. Hosts rate-limit anonymous downloads (HF answers 429 after a few
-    /// thousand files): on 429, 5xx or a dropped connection, back off (pausing *all* downloads
-    /// on 429) and retry. Returns a 2xx response, or `None` for 304 Not Modified.
-    async fn get(&self, url: &str, etag: Option<&str>) -> Result<Option<reqwest::Response>> {
-        let mut delay = Duration::from_secs(5);
-        for attempt in 1.. {
-            self.wait_for_download_pause().await;
-            let mut req = self.http.get(url);
-            if let Some(e) = etag {
-                req = req.header(reqwest::header::IF_NONE_MATCH, e);
-            }
-            let wait = match req.send().await {
-                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => return Ok(None),
-                Ok(resp)
-                    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS || resp.status().is_server_error() =>
-                {
-                    let after = resp
-                        .headers()
-                        .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok()?.trim().parse::<u64>().ok())
-                        .map(Duration::from_secs);
-                    let wait = after.unwrap_or(delay).min(MAX_BACKOFF);
-                    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        self.pause_downloads(wait);
-                    }
-                    if attempt >= MAX_ATTEMPTS {
-                        bail!("GET {url}: {} after {attempt} attempts", resp.status());
-                    }
-                    wait
-                }
-                Ok(resp) => return Ok(Some(resp.error_for_status().with_context(|| format!("GET {url}"))?)),
-                Err(e) if attempt < MAX_ATTEMPTS => {
-                    tracing::debug!("GET {url}: {e}");
-                    delay
-                }
-                Err(e) => return Err(e).with_context(|| format!("GET {url} after {attempt} attempts")),
-            };
-            tokio::time::sleep(wait).await;
-            delay = (delay * 2).min(MAX_BACKOFF);
-        }
-        unreachable!()
-    }
-
-    /// Fetches a small file under the base URL. `None` = not modified since `etag`.
-    async fn fetch(&self, path: &str, etag: Option<&str>) -> Result<Option<(Vec<u8>, Option<String>)>> {
-        if !self.is_http() {
-            let p = Path::new(&self.cfg.base_url).join(path);
-            return Ok(Some((tokio::fs::read(&p).await.with_context(|| format!("reading {}", p.display()))?, None)));
-        }
-        let url = self.url(path);
-        for attempt in 1..=3 {
-            let Some(resp) = self.get(&url, etag).await? else { return Ok(None) };
-            let etag = resp.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()).map(String::from);
-            match resp.bytes().await {
-                Ok(b) => return Ok(Some((b.to_vec(), etag))),
-                Err(e) if attempt < 3 => tracing::debug!("GET {url}: body: {e}"),
-                Err(e) => return Err(e).with_context(|| format!("GET {url}")),
-            }
-        }
-        unreachable!()
-    }
-
-    /// Streams a (large) published file to `dest`, checking its size and blake3 hash.
-    async fn download_to(&self, path: &str, dest: &Path, size: u64, hash: &str) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
-        let url = self.url(path);
-        let mut last_err = None;
-        for _ in 0..3 {
-            let resp = self.get(&url, None).await?.context("unexpected 304")?;
-            let mut file = tokio::fs::File::create(dest).await?;
-            let mut hasher = blake3::Hasher::new();
-            let mut stream = resp.bytes_stream();
-            let mut n = 0u64;
-            let mut ok = true;
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(c) => {
-                        hasher.update(&c);
-                        n += c.len() as u64;
-                        file.write_all(&c).await?;
-                    }
-                    Err(e) => {
-                        last_err = Some(anyhow::Error::from(e));
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            file.flush().await?;
-            if ok && n == size && hasher.finalize().to_hex().as_str() == hash {
-                return Ok(());
-            }
-            if ok {
-                last_err = Some(anyhow::anyhow!("{path}: size/hash mismatch"));
-            }
-        }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("{path}: download failed")))
-    }
-
-    /// Makes every download wait at least `d` (shared, so one 429 slows all workers down).
-    fn pause_downloads(&self, d: Duration) {
-        let until = Instant::now() + d;
-        let mut p = self.download_pause.lock();
-        if p.is_none_or(|cur| cur < until) {
-            *p = Some(until);
-            info!("download rate-limited by the data host, pausing {d:?}");
-        }
-    }
-
-    async fn wait_for_download_pause(&self) {
-        loop {
-            let until = *self.download_pause.lock();
-            match until {
-                Some(t) if t > Instant::now() => tokio::time::sleep_until(t.into()).await,
-                _ => return,
-            }
-        }
-    }
-
     async fn fetch_tile(&self, e: &ManifestEntry) -> Result<Vec<u8>> {
-        let (bytes, _) = self.fetch(&e.path, None).await?.context("unexpected 304")?;
+        let (bytes, _) = self.fetcher.fetch(&e.path, None).await?.context("unexpected 304")?;
         check_tile(e, &bytes)?;
         Ok(bytes)
     }
@@ -208,17 +78,17 @@ impl Index {
         tiles: Vec<ManifestEntry>,
         tx: tokio::sync::mpsc::Sender<(ManifestEntry, Result<Vec<u8>>)>,
     ) -> Vec<ManifestEntry> {
-        let (file, temp) = if self.is_http() {
+        let (file, temp) = if self.fetcher.is_http() {
             let dest = self.cfg.data_dir.join("tmp").join(format!("bundle-{}.tar", b.bundle));
             let _ = tokio::fs::create_dir_all(dest.parent().unwrap()).await;
-            if let Err(e) = self.download_to(&b.path, &dest, b.size, &b.file_hash).await {
+            if let Err(e) = self.fetcher.download_to(&b.path, &dest, b.size, &b.file_hash).await {
                 warn!("bundle {} failed ({e:#}), downloading its {} tiles one by one", b.path, tiles.len());
                 let _ = tokio::fs::remove_file(&dest).await;
                 return tiles;
             }
             (dest, true)
         } else {
-            (Path::new(&self.cfg.base_url).join(&b.path), false)
+            (self.fetcher.local(&b.path), false)
         };
         let path = b.path.clone();
         let read = tokio::task::spawn_blocking(move || {
@@ -254,7 +124,7 @@ impl Index {
     pub async fn sync(self: &Arc<Self>) -> Result<SyncReport> {
         let _guard = self.sync_lock.lock().await;
         let etag = self.manifest_etag.lock().clone();
-        let Some((bytes, new_etag)) = self.fetch("manifest.tsv", etag.as_deref()).await? else {
+        let Some((bytes, new_etag)) = self.fetcher.fetch("manifest.tsv", etag.as_deref()).await? else {
             return Ok(SyncReport::default());
         };
         let manifest = Manifest::parse(std::str::from_utf8(&bytes)?).map_err(anyhow::Error::msg)?;
@@ -405,6 +275,18 @@ impl Index {
         metrics::gauge!("geobox_tiles").set(applied.tiles.len() as f64);
         info!("sync: done ({} applied, {} removed, {} failed)", report.applied, report.removed, report.failed);
         Ok(report)
+    }
+
+    /// Merges the whole index into one segment (fastest to search) and deletes unused files.
+    pub fn compact(&self) -> Result<()> {
+        let mut writer: IndexWriter = self.index.writer_with_num_threads(1, self.cfg.writer_mb << 20)?;
+        let segments = self.index.searchable_segment_ids()?;
+        if segments.len() > 1 {
+            writer.merge(&segments).wait()?;
+        }
+        writer.garbage_collect_files().wait()?;
+        writer.wait_merging_threads()?;
+        self.reload()
     }
 
     fn commit(&self, writer: &mut IndexWriter, applied: &Applied) -> Result<()> {

@@ -18,7 +18,9 @@ Every config key can also be set as an environment variable `GEOBOX_<KEY>`, for 
 ## Inputs
 
 - **Planet**: `https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf` (~90 GB, updated
-  weekly). Mirrors work too.
+  weekly). Mirrors with the same file work too and are often much faster, e.g.
+  `https://mirror.init7.net/openstreetmap/pbf/planet-latest.osm.pbf` (~65 MB/s from Europe). A
+  download interrupted on one mirror can be resumed on another: the partial file is kept.
 - **Extracts** for testing or regional deployments, e.g. Geofabrik:
   `https://download.geofabrik.de/europe/italy-latest.osm.pbf`.
 - **A local file**: `planet_url = "/path/to/file.osm.pbf"`.
@@ -38,7 +40,8 @@ publishes if the last publish failed.
 | `merge` | Joins way segments into streets: same name (or same ref) and a shared end node or ends within ~100 m. Center = the segment midpoint closest to the street's average position | 1.7 min |
 | `borders` | Builds polygons from boundary ways. Boundaries with missing members (e.g. at an extract's edge) are skipped instead of guessed | 47 s |
 | `tiles` | Place context per street (suburb, city, region, country), then one SQLite file per tile and `manifest.tsv` | 6 min |
-| `bundles` | Packs tiles into up to 1024-tile tar bundles and lists them in the manifest | 11 s |
+| `bundles` | Packs tiles into up to 1024-tile tar bundles and lists them in the manifest | 1–11 s |
+| `snapshot` | Builds the server's search index from the tiles (with the server's own code), merges it into one segment and publishes it as `index/<version>-<hash>.tar.zst`, so servers don't have to index on first start. RAM: `index_writer_mb` (default 2048) | 12 min (1.8 GB archive) |
 
 \*16-thread desktop, 14 threads used, NVMe, 32 GB RAM. Before `index`, a local input file is
 md5-hashed (~3 min for 90 GB).
@@ -59,6 +62,7 @@ data/
   manifest.tsv                      # what servers read first
   tiles/8-<x>-<y>-<rowhash>.db.zst  # one zstd-compressed SQLite file per region
   bundles/<id>-<hash>.tar           # the same tiles, up to 1024 per tar
+  index/<version>-<hash>.tar.zst    # prebuilt search index for new servers
 ```
 
 File names contain a hash of their content. A region whose streets didn't change keeps exactly

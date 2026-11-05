@@ -36,7 +36,8 @@ GET /v1/search?q=hauptstr berlin
 
 ```sh
 geobox-server     # no config needed: defaults to the public world data set
-# first start: downloads ~560 MB in 60 files and builds a ~2.7 GB index, which takes a few minutes
+# first start: downloads the prebuilt index (1.8 GB) and is ready seconds after the download
+# (GEOBOX_BUILD_INDEX=1 builds it locally from ~560 MB of tiles instead, ~8 min)
 curl "http://localhost:8080/v1/search?q=central%20park%20west%20new%20york"
 ```
 
@@ -76,8 +77,8 @@ Requires Rust 1.89+. Everything else (SQLite, zstd) is compiled in.
 
 | | |
 |---|---|
-| Generator | ~25 min on 14 threads; output 555 MB of tiles + 562 MB of bundles |
-| Server first sync | 60 downloads, ~6–8 min; index 2.7 GB on disk |
+| Generator | ~35 min after the download; output 555 MB tiles + 562 MB bundles + 1.8 GB prebuilt index |
+| Server first start | download the 1.8 GB prebuilt index, ready ~13 s later; index 2.7 GB on disk |
 | Search at 100 req/s, uncached | p50 0.6 ms, p95 15 ms, p99 31–34 ms, ~0.25 CPU core |
 | Search, cached | p99 0.7 ms |
 | Idle | ~20 MB RAM, 0% CPU |

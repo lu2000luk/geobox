@@ -35,7 +35,7 @@ ref_tags = ["ref", "int_ref"]
 
 # boundary=administrative levels used for place context. 2 = country, 3-5 = region/state,
 # the highest level >= 6 that contains a street is shown as its city.
-admin_levels = [2, 4, 6, 7, 8]
+admin_levels = [2, 3, 4, 5, 6, 7, 8]  # 5 matters e.g. for Greater London
 # Place-name translations (name:<lang>) added to the searchable place text.
 place_langs = ["en"]
 
@@ -44,3 +44,6 @@ place_langs = ["en"]
 chunk_mb = 512
 zstd_level = 12
 threads = 0
+
+# RAM (MB) for building the prebuilt search index servers download on first start.
+index_writer_mb = 2048

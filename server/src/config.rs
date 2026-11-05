@@ -24,6 +24,8 @@ pub struct Config {
     pub abbrev_file: Option<PathBuf>,
     /// Queries slower than this are logged with a per-stage breakdown.
     pub slow_query_ms: u64,
+    /// Build the index locally from the tiles instead of downloading the published prebuilt one.
+    pub build_index: bool,
     pub weights: Weights,
 }
 
@@ -52,6 +54,7 @@ impl Default for Config {
             commit_every_tiles: 200,
             abbrev_file: None,
             slow_query_ms: 200,
+            build_index: false,
             weights: Weights { text: 1.0, dist: 1.5, class: 1.0 },
         }
     }
@@ -81,6 +84,7 @@ impl Config {
             commit_every_tiles: env("COMMIT_EVERY_TILES", d.commit_every_tiles)?,
             abbrev_file: std::env::var("GEOBOX_ABBREV_FILE").ok().map(PathBuf::from),
             slow_query_ms: env("SLOW_QUERY_MS", d.slow_query_ms)?,
+            build_index: std::env::var("GEOBOX_BUILD_INDEX").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes")),
             weights: Weights {
                 text: env("W_TEXT", d.weights.text)?,
                 dist: env("W_DIST", d.weights.dist)?,

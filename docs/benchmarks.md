@@ -13,15 +13,17 @@ Full planet (OSM planet of late October 2026): 27.1 M streets, 337,944 admin pol
 
 | | |
 |---|---|
-| Total (14 threads) | ~25 min, plus ~3 min to md5 the 90 GB input |
-| Output | 13,215 tiles (555 MB) + 60 bundles (562 MB) |
+| Total (all threads) | ~35 min after the download (~25 min data + ~12 min prebuilt index) |
+| Download | 90 GB at ~65 MB/s from mirror.init7.net (~25 min) |
+| Output | 13,215 tiles (555 MB) + 60 bundles (562 MB) + prebuilt index (1.8 GB) |
 | Work files | ~13 GB |
 
 ### Server
 
 | | |
 |---|---|
-| First sync from a local folder | ~6 min + ~1.5 min index merge |
+| First start, prebuilt index (default) | download 1.8 GB, then ready in ~13 s (unpack) |
+| First start, `GEOBOX_BUILD_INDEX=1` | ~6–9 min indexing + ~1.5 min merge |
 | Index size | 2.7 GB |
 | First sync from Hugging Face in a 2-CPU / 1 GB container | peak 466 MB RAM |
 | Idle (30 s sampled) | ~20 MB RSS, 0.000% CPU |

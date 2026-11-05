@@ -32,6 +32,8 @@ pub struct Config {
     pub zstd_level: i32,
     /// Worker threads, 0 = all cores.
     pub threads: usize,
+    /// RAM for building the prebuilt search index (`snapshot` stage), MB.
+    pub index_writer_mb: usize,
 }
 
 impl Default for Config {
@@ -72,11 +74,12 @@ impl Default for Config {
             name_tags: s(&["alt_name", "old_name", "official_name", "short_name", "loc_name", "reg_name", "int_name"]),
             name_langs: true,
             ref_tags: s(&["ref", "int_ref"]),
-            admin_levels: vec![2, 4, 6, 7, 8],
+            admin_levels: vec![2, 3, 4, 5, 6, 7, 8],
             place_langs: s(&["en"]),
             chunk_mb: 512,
             zstd_level: 12,
             threads: 0,
+            index_writer_mb: 2048,
         }
     }
 }

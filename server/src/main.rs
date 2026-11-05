@@ -19,7 +19,8 @@ const ATTRIBUTION: &str = "Data © OpenStreetMap contributors, ODbL (https://www
 
 #[derive(Clone)]
 struct App {
-    index: Arc<Index>,
+    /// Set once the index is open (after the prebuilt-index download on a first start).
+    index: Arc<std::sync::OnceLock<Arc<Index>>>,
     metrics: PrometheusHandle,
 }
 
@@ -41,11 +42,26 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         .install_recorder()?;
     let bind = cfg.bind.clone();
     let poll = Duration::from_secs(cfg.poll_secs.max(10));
-    let index = Index::open(cfg)?;
-    info!("index opened: {} roads in {} tiles, ready={}", index.road_count(), index.tile_count(), index.is_ready());
+    // Serve (health checks, 503 for searches) right away; the index arrives in the background.
+    let cell: Arc<std::sync::OnceLock<Arc<Index>>> = Arc::default();
 
-    let sync_index = index.clone();
+    let slot = cell.clone();
     tokio::spawn(async move {
+        // first start: install the published prebuilt index instead of indexing all tiles here
+        match geobox_server::bootstrap(&cfg).await {
+            Ok(true) | Ok(false) => {}
+            Err(e) => warn!("prebuilt index unavailable ({e:#}): building the index from tiles"),
+        }
+        let index = match Index::open(cfg) {
+            Ok(i) => i,
+            Err(e) => {
+                error!("cannot open the index: {e:#}");
+                std::process::exit(1);
+            }
+        };
+        info!("index opened: {} roads in {} tiles, ready={}", index.road_count(), index.tile_count(), index.is_ready());
+        let _ = slot.set(index.clone());
+        let sync_index = index;
         let mut backoff = Duration::from_secs(30);
         loop {
             let wait = match sync_index.sync().await {
@@ -75,14 +91,19 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_handler))
-        .with_state(App { index, metrics })
+        .with_state(App { index: cell, metrics })
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             Duration::from_secs(10),
         ))
         .layer(tower_http::compression::CompressionLayer::new())
         .layer(tower_http::cors::CorsLayer::permissive())
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+        .layer(
+            // 503 (overloaded / still syncing) is an expected answer, not an error worth an ERROR line;
+            // real search failures are logged by the handler
+            tower_http::trace::TraceLayer::new_for_http()
+                .on_failure(tower_http::trace::DefaultOnFailure::new().level(tracing::Level::DEBUG)),
+        );
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     info!("listening on {bind}");
     axum::serve(listener, app).with_graceful_shutdown(shutdown()).await?;
@@ -144,7 +165,22 @@ async fn search(
     {
         return error(StatusCode::BAD_REQUEST, "invalid lang");
     }
-    let result = app.index.search(Query { q, point, limit, lang: p.lang }).await;
+    let index = match app.index.get() {
+        Some(i) if i.is_ready() => i,
+        // answering from a half-built index would return confidently wrong streets
+        other => {
+            let msg = match other {
+                Some(i) => {
+                    format!("initial data sync in progress ({} tiles loaded so far), retry later", i.tile_count())
+                }
+                None => "starting: downloading the prebuilt index, retry later".to_string(),
+            };
+            let mut r = error(StatusCode::SERVICE_UNAVAILABLE, &msg);
+            r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+            return r;
+        }
+    };
+    let result = index.search(Query { q, point, limit, lang: p.lang }).await;
     let status = match &result {
         Ok(_) => "ok",
         Err(SearchError::Overloaded) => "overloaded",
@@ -155,7 +191,7 @@ async fn search(
     match result {
         Ok(results) => axum::Json(serde_json::json!({
             "results": results,
-            "data_timestamp": app.index.meta("osm_timestamp").and_then(|t| t.parse::<i64>().ok()),
+            "data_timestamp": index.meta("osm_timestamp").and_then(|t| t.parse::<i64>().ok()),
             "attribution": ATTRIBUTION,
         }))
         .into_response(),
@@ -172,10 +208,10 @@ async fn search(
 }
 
 async fn readyz(State(app): State<App>) -> Response {
-    if app.index.is_ready() {
-        (StatusCode::OK, "ready").into_response()
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "initial sync in progress").into_response()
+    match app.index.get() {
+        Some(i) if i.is_ready() => (StatusCode::OK, "ready").into_response(),
+        Some(_) => (StatusCode::SERVICE_UNAVAILABLE, "initial sync in progress").into_response(),
+        None => (StatusCode::SERVICE_UNAVAILABLE, "starting: downloading the prebuilt index").into_response(),
     }
 }
 

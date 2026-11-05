@@ -9,9 +9,12 @@ geobox-server                                   # = GEOBOX_BASE_URL=https://hugg
 GEOBOX_BASE_URL=./data geobox-server            # your own data, from a folder or URL
 ```
 
-On start it opens the local index (if any) and serves right away. A background task then syncs.
-The first sync downloads everything, and `/readyz` turns 200 when it's done. The HTTP API is in
-[api.md](api.md).
+On the first start (empty `GEOBOX_DATA_DIR`) it downloads the **prebuilt index** the generator
+published (`index/*.tar.zst`, verified by hash) and installs it, so no indexing happens on the server.
+After that it only applies changed tiles. Set `GEOBOX_BUILD_INDEX=1` to build the index locally from
+the tiles instead (also the automatic fallback when no compatible prebuilt index is published or its
+download fails). It serves right away: `/healthz` is 200, and searches and `/readyz` return 503 until
+the data is loaded. The HTTP API is in [api.md](api.md).
 
 ## Configuration
 
@@ -31,6 +34,7 @@ All settings are environment variables.
 | `GEOBOX_DOWNLOAD_CONCURRENCY` | `8` | Parallel tile downloads (bundles: 2 at a time) |
 | `GEOBOX_COMMIT_EVERY_TILES` | `200` | Sync checkpoint interval |
 | `GEOBOX_SLOW_QUERY_MS` | `200` | Log searches slower than this, with a per-stage breakdown |
+| `GEOBOX_BUILD_INDEX` | off | `1` = build the index locally from tiles instead of downloading the prebuilt one |
 | `GEOBOX_ABBREV_FILE` | built-in | Custom abbreviation table (format: [`server/abbrev.tsv`](../server/abbrev.tsv)) |
 | `GEOBOX_W_TEXT` / `GEOBOX_W_DIST` / `GEOBOX_W_CLASS` | `1.0` / `1.5` / `1.0` | Ranking weights (see [how it works](how-it-works.md#ranking)) |
 
@@ -38,6 +42,9 @@ All settings are environment variables.
 
 - **Polling.** Every `GEOBOX_POLL_SECS` the server re-reads `manifest.tsv`. It sends `If-None-Match`, so
   an unchanged manifest costs one tiny request.
+- **First start.** The prebuilt index is downloaded, checked against its hash, unpacked into a staging
+  folder and only then moved into place, together with the list of tiles it contains. An interrupted
+  download starts over on the next start; nothing half-written is ever used.
 - **What gets downloaded.** Only tiles whose content hash changed are fetched. Each changed area
   comes either as a **bundle** or as single tiles:
   - A bundle is one tar of up to 1024 tiles. It's used on a first sync, or when 50+ tiles, half the

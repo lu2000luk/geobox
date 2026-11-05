@@ -92,6 +92,20 @@ const ROWS: &[Row] = &[
         "Amarillo Texas United States",
         "US",
     ),
+    ("Via di Casal Boccone", "", "", 5, 41.9650, 12.5500, "Roma, Lazio, Italia", "Roma Rome Lazio Italia Italy", "IT"),
+    // a second, unjoined piece of the same street ~250 m away: must show up once
+    ("Via di Casal Boccone", "", "", 5, 41.9665, 12.5522, "Roma, Lazio, Italia", "Roma Rome Lazio Italia Italy", "IT"),
+    (
+        "Via Di Sorrento",
+        "",
+        "",
+        5,
+        26.4024,
+        -80.1731,
+        "Palm Beach County, Florida, United States",
+        "Palm Beach County Florida United States",
+        "US",
+    ),
 ];
 
 fn write_tiles(dir: &Path) {
@@ -213,6 +227,11 @@ async fn smart_search_behaviours() {
     assert!(r[0].0 == "Via Roma" && r[0].1.starts_with("Milano"), "{r:?}");
     assert_eq!(top(&idx, "route 66", None).await[0].0, "Route 66");
     assert_eq!(top(&idx, "66", None).await[0].0, "Route 66");
+    // the user-reported query, with a far-away street sharing the generic words
+    assert_eq!(top(&idx, "via di casal boccone", Some((41.7658, 12.2814))).await[0].0, "Via di Casal Boccone");
+    assert_eq!(top(&idx, "via di casal boccone roma", None).await[0].0, "Via di Casal Boccone");
+    let r = top(&idx, "casal boccone", None).await;
+    assert_eq!(r.iter().filter(|x| x.0 == "Via di Casal Boccone").count(), 1, "pieces merged: {r:?}");
     // noise only -> nothing; unknown street -> nothing
     assert!(top(&idx, "345 00185", None).await.is_empty());
     assert!(top(&idx, "zzzzqqq", None).await.is_empty());
@@ -294,4 +313,36 @@ async fn resync_is_incremental_and_removes_tiles() {
     let idx = Index::open(cfg).unwrap();
     assert!(idx.is_ready());
     assert_eq!(idx.sync().await.unwrap().applied, 0);
+}
+
+#[tokio::test]
+async fn prebuilt_index_bootstrap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("published");
+    write_tiles(&data);
+    // generator side: build + publish the index
+    let (path, hash, size) = geobox_server::build_snapshot(&data, &tmp.path().join("build"), 64).await.unwrap();
+    let mut m = Manifest::parse(&std::fs::read_to_string(data.join("manifest.tsv")).unwrap()).unwrap();
+    geobox_server::add_to_manifest(&mut m, &path, &hash, size);
+    std::fs::write(data.join("manifest.tsv"), m.to_tsv()).unwrap();
+
+    // GEOBOX_BUILD_INDEX=1: no download, the normal sync builds it
+    let opt_out = Config {
+        base_url: data.to_string_lossy().into(),
+        data_dir: tmp.path().join("own"),
+        build_index: true,
+        ..Config::default()
+    };
+    assert!(!geobox_server::bootstrap(&opt_out).await.unwrap());
+
+    // server side: a fresh data dir gets the prebuilt index and is ready without indexing anything
+    let cfg = Config { base_url: data.to_string_lossy().into(), data_dir: tmp.path().join("srv"), ..Config::default() };
+    assert!(geobox_server::bootstrap(&cfg).await.unwrap());
+    assert!(!geobox_server::bootstrap(&cfg).await.unwrap(), "second start: local data already there");
+    let idx = Index::open(cfg).unwrap();
+    assert!(idx.is_ready());
+    assert_eq!(idx.road_count(), ROWS.len() as u64);
+    let r = idx.sync().await.unwrap();
+    assert_eq!((r.applied, r.failed), (0, 0), "snapshot already matches the manifest");
+    assert_eq!(top(&idx, "baker street", None).await[0].0, "Baker Street");
 }
